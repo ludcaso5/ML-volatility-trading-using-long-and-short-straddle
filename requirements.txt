@@ -1,1 +1,12 @@
-
+numpy==2.2.6
+pandas==2.2.3
+scikit-learn==1.7.2
+catboost==1.2.8
+joblib==1.5.2
+matplotlib==3.10.6
+yfinance==0.2.66
+pandas-datareader==0.10.0
+pandas-market-calendars==5.1.1
+SQLAlchemy==2.0.43
+psycopg2-binary==2.9.10
+pyarrow==21.0.0
