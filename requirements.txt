@@ -11,5 +11,3 @@ SQLAlchemy==2.0.43
 psycopg2-binary==2.9.10
 pyarrow==21.0.0
 ta==0.11.0
-results/backtest/
-results/classification/
