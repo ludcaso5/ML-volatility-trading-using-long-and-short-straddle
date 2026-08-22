@@ -11,3 +11,5 @@ results/models/
 
 .env
 *.env
+results/backtest/
+results/classification/
