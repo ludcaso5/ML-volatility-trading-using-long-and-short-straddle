@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
+
+data/wrds_cache/
+results/models/
+*.joblib
+
+.env
+*.env
