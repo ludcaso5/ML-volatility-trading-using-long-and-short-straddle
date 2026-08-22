@@ -40,7 +40,12 @@ import classification as CLF
 # Project output paths
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
-BACKTEST_ROOT = PROJECT_ROOT / "results" / "backtest"
+RESULTS_DIR = PROJECT_ROOT / "results"
+BACKTEST_ROOT = RESULTS_DIR / "backtest"
+
+BACKTEST_SUMMARY_CSV = RESULTS_DIR / "backtest_summary.csv"
+CLASSIFICATION_METRICS_CSV = RESULTS_DIR / "classification_metrics.csv"
+
 RUN_TAG = datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%SZ")
 RUN_DIR = BACKTEST_ROOT / RUN_TAG
 REG_DIR = RUN_DIR / "regression_models"
@@ -212,8 +217,13 @@ def backtest_straddle(df: pd.DataFrame, h: int,
     strat_ret = (pos * step).clip(-0.999, 0.999).fillna(0.0)
 
     capital = (1.0 + strat_ret).cumprod() * float(capital0)
-    pnl_step = capital.diff().fillna(0.0)
-    pnl_cum  = pnl_step.cumsum()
+
+    pnl_step = capital.diff()
+    if not pnl_step.empty:
+        pnl_step.iloc[0] = capital.iloc[0] - float(capital0)
+    pnl_step = pnl_step.fillna(0.0)
+
+    pnl_cum = pnl_step.cumsum()
 
     out = pd.DataFrame({
         "date": df["date"].values,
@@ -253,7 +263,8 @@ def perf_metrics(step_series: pd.Series, dates: Optional[pd.Index] = None) -> di
     else:
         years = len(r) / max(1.0, steps_per_year)
 
-    dd = eq / eq.cummax() - 1.0
+    running_max = eq.cummax().clip(lower=1.0)
+    dd = eq / running_max - 1.0
     max_dd = float(dd.min())
     try:
         cagr = (eq.iloc[-1] ** (1.0 / max(1e-9, years))) - 1.0
@@ -313,8 +324,9 @@ def plot_equity_and_drawdown(eq_sig: pd.Series, eq_spx: pd.Series, h: int, subti
     def _prep(s: pd.Series) -> pd.Series:
         s = pd.to_numeric(s, errors="coerce").astype(float).reindex(ref).ffill().bfill()
         s = s.replace([np.inf, -np.inf], np.nan).ffill().bfill()
-        if not len(s) or not np.isfinite(s.iloc[0]) or s.iloc[0] == 0: s.iloc[0] = 1.0
-        return s / s.iloc[0]
+        if s.empty:
+            return s
+        return s.clip(lower=1e-8)
 
     e_sig, e_spx = _prep(eq_sig), _prep(eq_spx)
 
@@ -371,8 +383,8 @@ def plot_equity_and_drawdown(eq_sig: pd.Series, eq_spx: pd.Series, h: int, subti
                      bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.85))
 
 
-    dd_sig = e_sig / e_sig.cummax() - 1.0
-    dd_spx = e_spx / e_spx.cummax() - 1.0
+    dd_sig = e_sig / e_sig.cummax().clip(lower=1.0) - 1.0
+    dd_spx = e_spx / e_spx.cummax().clip(lower=1.0) - 1.0
 
     ax2.plot(dd_spx.index, dd_spx, lw=1.6, label="SPX", color=c_spx)
     ax2.plot(dd_sig.index, dd_sig, lw=1.6, label="straddle", color=c_strat)
@@ -446,10 +458,15 @@ def classifier_test_error(df_bt: pd.DataFrame, h: int) -> Tuple[float, int, floa
 def run_backtest(alloc: float = 0.2) -> Dict[int, pd.DataFrame]:
     df_bt = load_backtest_data()
     spx_equity = compute_spx_equity(df_bt)
+
     results: Dict[int, pd.DataFrame] = {}
+    summary_rows = []
+
     for h in HORIZONS:
         if R.load_artifact(h, rank=1) is None:
-            print(f"[H={h}] régression absente."); continue
+            print(f"[H={h}] régression absente.")
+            continue
+
         try:
             _ = CLF.apply_saved_classifier(df_bt, h)
         except Exception as e:
@@ -459,12 +476,40 @@ def run_backtest(alloc: float = 0.2) -> Dict[int, pd.DataFrame]:
         mse_t, r2_t, n_reg = regression_test_metrics(df_bt, h)
         err_t, n_clf, cov_t = classifier_test_error(df_bt, h)
 
-        res = backtest_straddle(df_bt, h, exposure=alloc, capital0=1.0)
+        res = backtest_straddle(
+            df_bt,
+            h,
+            exposure=alloc,
+            capital0=1.0,
+        )
+
         results[h] = res
         res.to_csv(RUN_DIR / f"backtest_H{h}.csv")
 
-
         m = perf_metrics(res["strategy_ret"], dates=res.index)
+
+        spx_eq_aligned = spx_equity.reindex(res.index).ffill().bfill()
+        spx_ret = spx_eq_aligned.pct_change().fillna(0.0)
+        m_spx = perf_metrics(spx_ret, dates=res.index)
+
+        summary_rows.append({
+            "Horizon": h,
+            "Strategy_Final_Value": float(res["capital"].iloc[-1]),
+            "Strategy_CAGR": float(m["cagr"]),
+            "Strategy_Volatility": float(m["vol_ann"]),
+            "Strategy_Sharpe": float(m["sharpe"]),
+            "Strategy_Max_Drawdown": float(m["max_dd"]),
+            "SPX_Final_Value": float(spx_eq_aligned.iloc[-1]),
+            "SPX_CAGR": float(m_spx["cagr"]),
+            "SPX_Volatility": float(m_spx["vol_ann"]),
+            "SPX_Sharpe": float(m_spx["sharpe"]),
+            "Regression_MSE": float(mse_t),
+            "Regression_R2": float(r2_t),
+            "Classification_Error": float(err_t),
+            "Classification_Coverage": float(cov_t),
+            "N_Regression": int(n_reg),
+            "N_Classification": int(n_clf),
+        })
 
         def _fmt(x, nd=6):
             return "N/A" if pd.isna(x) else f"{x:.{nd}f}"
@@ -472,41 +517,97 @@ def run_backtest(alloc: float = 0.2) -> Dict[int, pd.DataFrame]:
         def _fmt_pct(x, nd=2):
             return "N/A" if pd.isna(x) else f"{x:.{nd}%}"
 
-        print(f"[H={h}] TEST 2018-2023 | Régression: MSE={_fmt(mse_t)} R²={_fmt(r2_t, 4)} (n={n_reg}) "
-              f"| Classif: err_décisions={_fmt_pct(err_t)} (n={n_clf}, coverage={_fmt_pct(cov_t)})")
+        print(
+            f"[H={h}] TEST 2018-2023 | "
+            f"Régression: MSE={_fmt(mse_t)} R²={_fmt(r2_t, 4)} (n={n_reg}) "
+            f"| Classif: err_décisions={_fmt_pct(err_t)} "
+            f"(n={n_clf}, coverage={_fmt_pct(cov_t)})"
+        )
 
-        print(f"         Straddle | Capital_fin={res['capital'].iloc[-1]:.2f} $ "
-              f"| vol={_fmt(m['vol_ann'], 4)} sharpe={_fmt(m['sharpe'], 2)} | CAGR={_fmt_pct(m['cagr'])}")
+        print(
+            f"         Straddle | Capital_fin={res['capital'].iloc[-1]:.2f} "
+            f"| vol={_fmt(m['vol_ann'], 4)} "
+            f"sharpe={_fmt(m['sharpe'], 2)} "
+            f"| CAGR={_fmt_pct(m['cagr'])}"
+        )
 
+        print(
+            f"         SPX      | Capital_fin={spx_eq_aligned.iloc[-1]:.2f} "
+            f"| vol={_fmt(m_spx['vol_ann'], 4)} "
+            f"sharpe={_fmt(m_spx['sharpe'], 2)} "
+            f"| CAGR={_fmt_pct(m_spx['cagr'])}"
+        )
 
-        spx_eq_aligned = spx_equity.reindex(res.index).ffill().bfill()
-        spx_ret = spx_eq_aligned.pct_change().fillna(0.0)
-        m_spx = perf_metrics(spx_ret, dates=res.index)
-        print(f"         SPX      | Capital_fin={spx_eq_aligned.iloc[-1] * 1:.2f} $ "
-              f"| vol={_fmt(m_spx['vol_ann'], 4)} sharpe={_fmt(m_spx['sharpe'], 2)} | CAGR={_fmt_pct(m_spx['cagr'])}")
+        equity_x = res["capital"].astype(float)
+        plot_equity_and_drawdown(
+            equity_x,
+            spx_equity,
+            h,
+            subtitle=f"(alloc={alloc})",
+        )
 
-        equity_x = (res["capital"] / 1.0).astype(float)
-        plot_equity_and_drawdown(equity_x, spx_equity, h, subtitle=f"(alloc={alloc})")
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(
+        BACKTEST_SUMMARY_CSV,
+        index=False,
+        float_format="%.6f",
+    )
+
+    print(f"\n[Backtest summary] -> {BACKTEST_SUMMARY_CSV.resolve()}")
+
     return results
 
 def main() -> None:
     print("=== Chargement des données d’entraînement ===")
-    data = R.load_dataset_from_csv(start=TRAIN_START, end=TRAIN_END)
-    print(f"Fenêtre d’entraînement : {data['date'].min():%Y-%m-%d} → {data['date'].max():%Y-%m-%d} | N={len(data)}")
 
-    missing = [h for h in HORIZONS if R.get_best_model(h, rank=1) is None]
+    data = R.load_dataset_from_csv(
+        start=TRAIN_START,
+        end=TRAIN_END,
+    )
+
+    print(
+        f"Fenêtre d’entraînement : "
+        f"{data['date'].min():%Y-%m-%d} → "
+        f"{data['date'].max():%Y-%m-%d} | "
+        f"N={len(data)}"
+    )
+
+    missing = [
+        h for h in HORIZONS
+        if R.get_best_model(h, rank=1) is None
+    ]
+
     if missing:
         raise FileNotFoundError(
-            f"Missing regression artifacts for horizons {missing}. Run Regression.py first."
+            f"Missing regression artifacts for horizons {missing}. "
+            "Run Regression.py first."
+        )
+
+    _ = retrain_classifier_global(
+        data,
+        valid_start=R.VALIDATION_START,
+        valid_end=R.END_DATE,
+        quiet=True,
+    )
+
+    if CLF.METRICS_VAL_CSV.exists():
+        classification_metrics = pd.read_csv(CLF.METRICS_VAL_CSV)
+
+        classification_metrics.to_csv(
+            CLASSIFICATION_METRICS_CSV,
+            index=False,
+            float_format="%.6f",
+        )
+
+        print(
+            f"[Classification metrics] -> "
+            f"{CLASSIFICATION_METRICS_CSV.resolve()}"
         )
 
     retrain_best_regressions(data)
 
     R.MODEL_REGISTRY.clear()
     R.MODEL_STORE_DIR = REG_DIR
-
-
-    _ = retrain_classifier_global(data, valid_start=R.VALIDATION_START, valid_end=R.END_DATE, quiet=True)
 
     print("\n=== Backtest 2018-2023 ===")
     _ = run_backtest(alloc=0.2)
