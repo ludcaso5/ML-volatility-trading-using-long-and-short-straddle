@@ -21,4 +21,3 @@ Projet réalisé par :
 ## Données
 
 Les données proviennent principalement de **OptionMetrics/WRDS, Yahoo Finance et FRED**. Certaines données propriétaires ne sont pas incluses dans le dépôt.
-```
